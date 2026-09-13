@@ -4,7 +4,7 @@ node_modules/
 .output/
 .data/
 .cache/
-dist/
+/dist
 coverage/
 
 # Environment-specific settings; only the blank example is tracked
