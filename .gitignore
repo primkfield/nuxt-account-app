@@ -1,0 +1,20 @@
+# Dependencies and generated output
+node_modules/
+.nuxt/
+.output/
+.data/
+.cache/
+dist/
+coverage/
+
+# Environment-specific settings; only the blank example is tracked
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs and local editor / OS files
+*.log
+.DS_Store
+.idea/
+.vscode/

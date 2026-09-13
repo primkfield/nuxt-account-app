@@ -1,0 +1,19 @@
+{
+  "name": "nuxt-account-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "typecheck": "nuxt typecheck",
+    "postinstall": "nuxt prepare"
+  },
+  "dependencies": {
+    "nuxt": "4.5.2",
+    "oidc-client-ts": "3.5.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.0",
+    "vue-tsc": "^3.1.0"
+  }
+}
