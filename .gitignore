@@ -6,6 +6,9 @@ node_modules/
 .cache/
 /dist
 coverage/
+.venv/
+__pycache__/
+*.pyc
 
 # Environment-specific settings; only the blank example is tracked
 .env

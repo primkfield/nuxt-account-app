@@ -1,0 +1,585 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Nuxt static hosting, Cognito managed login, HTTP API JWT authorization,
+  and a minimal profile API. Deploy in a standard commercial AWS Region.
+  Nuxt assets and its OIDC client are deployed separately.
+
+Resources:
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-s3-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  StaticCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-static'
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  ApiCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-api-no-cache'
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  ApiOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${AWS::StackName}-api-forward'
+        Comment: Forward Authorization and replace the viewer Host at the origin.
+        HeadersConfig:
+          HeaderBehavior: allExcept
+          Headers: [host]
+        CookiesConfig:
+          CookieBehavior: none
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}-headers'
+        SecurityHeadersConfig:
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            Override: true
+
+  NuxtPathFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-nuxt-paths'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Map Nuxt prerendered paths to S3 object keys, static behavior only.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (uri === '/api' || uri.indexOf('/api/') === 0) {
+            return request;
+          }
+          if (uri.endsWith('/')) {
+            request.uri += 'index.html';
+          } else if (uri.split('/').pop().indexOf('.') === -1) {
+            request.uri += '/index.html';
+          }
+          return request;
+        }
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      # Same-origin /api calls: no CORS dependency on CloudFront here.
+      # Direct calls remain protected by JWT authorization on each route.
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} Nuxt and profile API'
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_200
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: api
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !Ref StaticCachePolicy
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt NuxtPathFunction.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref ApiCachePolicy
+            OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+          - PathPattern: /api
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: !Ref ApiCachePolicy
+            OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
+            ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadThroughThisDistribution
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt FrontendBucket.Arn
+              - !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UserPoolTier: ESSENTIALS
+      DeletionProtection: ACTIVE
+      UsernameAttributes: [email]
+      UsernameConfiguration:
+        CaseSensitive: false
+      AutoVerifiedAttributes: [email]
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      MfaConfiguration: 'ON'
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate: [email]
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub
+        - 'nuxt-${AWS::AccountId}-${UniqueId}'
+        - UniqueId: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+      ManagedLoginVersion: 2
+
+  ApiResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Sub 'https://${WebDistribution.DomainName}/api'
+      Name: profile-api
+      Scopes:
+        - ScopeName: profile.read
+          ScopeDescription: Read your own profile
+        - ScopeName: profile.write
+          ScopeDescription: Update your own display name and locale
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ApiResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${AWS::StackName}-nuxt'
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - !Sub 'https://${WebDistribution.DomainName}/api/profile.read'
+        - !Sub 'https://${WebDistribution.DomainName}/api/profile.write'
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub 'https://${WebDistribution.DomainName}/login/callback'
+      DefaultRedirectURI: !Sub 'https://${WebDistribution.DomainName}/login/callback'
+      LogoutURLs:
+        - !Sub 'https://${WebDistribution.DomainName}/'
+      ReadAttributes: [email, email_verified, sub]
+      WriteAttributes: [email]
+      AccessTokenValidity: 10
+      IdTokenValidity: 10
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      EnableTokenRevocation: true
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+
+  ManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    DependsOn: UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientId: !Ref UserPoolClient
+      UseCognitoProvidedValues: true
+
+  ProfileTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  ProfileLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  ProfileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProfileDataAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt ProfileTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ProfileLogGroup.Arn
+
+  ProfileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 10
+      Role: !GetAtt ProfileRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ProfileLogGroup
+      Environment:
+        Variables:
+          PROFILE_TABLE: !Ref ProfileTable
+      Code:
+        ZipFile: |
+          import base64
+          import json
+          import os
+          import unicodedata
+          from datetime import datetime, timezone
+          from decimal import Decimal
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          table = boto3.resource('dynamodb').Table(os.environ['PROFILE_TABLE'])
+
+          def reply(code, body):
+              return {
+                  'statusCode': code,
+                  'headers': {
+                      'content-type': 'application/json; charset=utf-8',
+                      'cache-control': 'no-store',
+                  },
+                  'body': json.dumps(body, ensure_ascii=False),
+              }
+
+          def public_profile(item):
+              return {
+                  'displayName': item.get('displayName', ''),
+                  'locale': item.get('locale', 'ja-JP'),
+                  'version': int(item.get('version', 0)),
+              }
+
+          def handler(event, context):
+              rc = event.get('requestContext', {})
+              jwt = rc.get('authorizer', {}).get('jwt', {})
+              claims = jwt.get('claims', {})
+              sub = claims.get('sub')
+              if not isinstance(sub, str) or not sub or claims.get('token_use') != 'access':
+                  return reply(401, {'message': 'Unauthorized'})
+
+              route = event.get('routeKey')
+              required = {'GET /api/me': 'profile.read', 'PATCH /api/me': 'profile.write'}
+              if route not in required:
+                  return reply(404, {'message': 'Not found'})
+
+              # API Gateway verifies the full scope. No userId is accepted from the body.
+              key = {'pk': 'USER#' + sub, 'sk': 'PROFILE'}
+              try:
+                  if route == 'GET /api/me':
+                      item = table.get_item(Key=key, ConsistentRead=True).get('Item', {})
+                      if item and item.get('status') != 'ACTIVE':
+                          return reply(403, {'message': 'Account unavailable'})
+                      return reply(200, public_profile(item))
+
+                  headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+                  if headers.get('content-type', '').split(';')[0].strip().lower() != 'application/json':
+                      return reply(415, {'message': 'Use application/json'})
+                  raw = event.get('body') or ''
+                  if len(raw) > 8192:
+                      return reply(413, {'message': 'Body too large'})
+                  try:
+                      raw_bytes = base64.b64decode(raw, validate=True) if event.get('isBase64Encoded') else raw.encode('utf-8')
+                      if len(raw_bytes) > 4096:
+                          return reply(413, {'message': 'Body too large'})
+                      body = json.loads(raw_bytes)
+                  except (ValueError, UnicodeError):
+                      return reply(400, {'message': 'Invalid JSON'})
+                  if not isinstance(body, dict) or set(body) != {'displayName', 'locale', 'version'}:
+                      return reply(400, {'message': 'Send displayName, locale and version only'})
+                  name, locale, version = body['displayName'], body['locale'], body['version']
+                  if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+                      return reply(400, {'message': 'displayName must contain 1-80 characters'})
+                  if any(unicodedata.category(c).startswith('C') for c in name):
+                      return reply(400, {'message': 'Unsupported displayName characters'})
+                  if locale not in ('ja-JP', 'en-US') or type(version) is not int or not 0 <= version < 2147483647:
+                      return reply(400, {'message': 'Invalid locale or version'})
+
+                  now = datetime.now(timezone.utc).isoformat()
+                  values = {
+                      ':name': name.strip(), ':locale': locale,
+                      ':next': Decimal(version + 1), ':active': 'ACTIVE', ':now': now,
+                  }
+                  names = {'#v': 'version', '#s': 'status'}
+                  if version == 0:
+                      condition = 'attribute_not_exists(pk)'
+                  else:
+                      condition = '#v = :expected AND #s = :active'
+                      values[':expected'] = Decimal(version)
+                  result = table.update_item(
+                      Key=key,
+                      UpdateExpression='SET displayName = :name, locale = :locale, #v = :next, #s = :active, createdAt = if_not_exists(createdAt, :now), updatedAt = :now',
+                      ConditionExpression=condition,
+                      ExpressionAttributeNames=names,
+                      ExpressionAttributeValues=values,
+                      ReturnValues='ALL_NEW',
+                  )
+                  return reply(200, public_profile(result['Attributes']))
+              except ClientError as exc:
+                  error_code = exc.response.get('Error', {}).get('Code', '')
+                  if error_code == 'ConditionalCheckFailedException':
+                      return reply(409, {'message': 'Reload profile before saving'})
+                  print(json.dumps({'event': 'profile_error', 'requestId': rc.get('requestId'), 'errorCode': error_code}))
+                  return reply(500, {'message': 'Internal error'})
+
+  ProfileIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !GetAtt ProfileFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 10000
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: cognito-jwt
+      AuthorizerType: JWT
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+        Audience: [!Ref UserPoolClient]
+
+  GetProfileRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /api/me
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes:
+        - !Sub 'https://${WebDistribution.DomainName}/api/profile.read'
+      Target: !Sub 'integrations/${ProfileIntegration}'
+
+  PatchProfileRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: PATCH /api/me
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes:
+        - !Sub 'https://${WebDistribution.DomainName}/api/profile.write'
+      Target: !Sub 'integrations/${ProfileIntegration}'
+
+  GetProfilePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProfileFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/GET/api/me'
+
+  PatchProfilePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProfileFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/PATCH/api/me'
+
+  HttpStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength"}'
+
+Outputs:
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Value: !Ref WebDistribution
+  AppUrl:
+    Value: !Sub 'https://${WebDistribution.DomainName}'
+  ApiBaseUrl:
+    Value: !Sub 'https://${WebDistribution.DomainName}/api'
+  UserPoolId:
+    Value: !Ref UserPool
+  CognitoIssuer:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+  CognitoDomain:
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+  CognitoClientId:
+    Value: !Ref UserPoolClient
+  CognitoRedirectUri:
+    Value: !Sub 'https://${WebDistribution.DomainName}/login/callback'
+  CognitoLogoutUri:
+    Value: !Sub 'https://${WebDistribution.DomainName}/'
+  CognitoScopes:
+    Value: !Sub 'openid email https://${WebDistribution.DomainName}/api/profile.read https://${WebDistribution.DomainName}/api/profile.write'
+  ProfileTableName:
+    Value: !Ref ProfileTable

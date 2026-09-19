@@ -1,0 +1,12 @@
+[project]
+name = "nuxt-account-verification"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "boto3==1.43.98",
+    "moto[dynamodb]==5.2.3",
+    "PyYAML==6.0.3",
+]
+
+[tool.uv]
+package = false
