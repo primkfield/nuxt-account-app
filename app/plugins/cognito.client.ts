@@ -78,8 +78,11 @@ export default defineNuxtPlugin(() => {
     },
     async logout() {
       const client = requireManager()
-      // If revocation fails, leave the user on the page so they can retry.
-      await client.revokeTokens(['refresh_token'])
+      // Expired access tokens do not imply that the in-memory refresh token is gone.
+      // After a reload there is no user; still visit /logout to end the login cookie.
+      const user = await client.getUser()
+      // If revocation fails, preserve the user and the session-ending action for retry.
+      if (user?.refresh_token) await client.revokeTokens(['refresh_token'])
       await client.removeUser()
       state.authenticated = false
       const logout = new URL('/logout', config.cognitoDomain)

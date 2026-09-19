@@ -29,7 +29,7 @@ async function save() {
   } catch (error) { report(error) }
   finally { busy.value = false }
 }
-async function login() { try { await auth?.login() } catch (error) { report(error) } }
+async function login() { busy.value = true; try { await auth?.login() } catch (error) { report(error); busy.value = false } }
 async function logout() { busy.value = true; try { await auth?.logout() } catch { failed.value = true; message.value = 'ログアウト処理を完了できませんでした。接続を確認し、再試行してください。'; busy.value = false } }
 onMounted(load)
 </script>
@@ -43,10 +43,17 @@ onMounted(load)
           <label for="display-name">表示名</label><input id="display-name" v-model="profile.displayName" maxlength="80" required autocomplete="off" :disabled="busy || !loaded">
           <label for="locale">表示言語</label><select id="locale" v-model="profile.locale" :disabled="busy || !loaded"><option value="ja-JP">日本語</option><option value="en-US">English</option></select>
           <p class="muted">保存バージョン：{{ profile.version }}<span v-if="profile.version === 0">（まだ保存されていません）</span></p>
-          <div class="actions"><button :disabled="busy || !loaded" type="submit">保存する</button><button :disabled="busy" class="secondary" type="button" @click="load">再取得</button><button :disabled="busy" class="secondary" type="button" @click="logout">ログアウト</button></div>
+          <div class="actions"><button :disabled="busy || !loaded" type="submit">保存する</button><button :disabled="busy" class="secondary" type="button" @click="load">再取得</button></div>
         </form>
       </div>
-      <div v-else class="card"><h2>ログインしてください</h2><p>プロフィール情報は、ログイン後にAPIから取得します。静的なHTMLには含まれません。</p><button @click="login">Cognitoでログイン</button></div>
+      <div v-else class="card">
+        <h2>ログインしてください</h2><p>プロフィール情報は、ログイン後にAPIから取得します。静的なHTMLには含まれません。</p>
+        <button :disabled="busy || !auth?.state.configured" @click="login">Cognitoでログイン</button>
+        <p class="muted">認証期限切れや再読み込み後も、Cognitoのログインセッションが残る場合があります。下のボタンから終了できます。再読み込みで失われたトークンの失効や、他の端末のログアウトは行えません。</p>
+      </div>
+      <div class="actions">
+        <button :disabled="busy || !auth?.state.configured" class="secondary" type="button" @click="logout">{{ auth?.state.authenticated ? 'ログアウト' : 'Cognitoのセッションを終了する' }}</button>
+      </div>
       <template #fallback><p role="status">認証状態を確認しています。</p></template>
     </ClientOnly>
     <p v-if="message" :role="failed ? 'alert' : 'status'" class="status" :class="{error:failed}">{{ message }}</p>
